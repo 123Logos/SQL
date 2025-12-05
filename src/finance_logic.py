@@ -562,35 +562,13 @@ class FinanceService:
                     if subsidy_amount <= 0:
                         continue
 
-                    result = self.session.execute(
-                        text("""INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
-                                VALUES (:user_id, 'user', :amount, :valid_from, :valid_to, 'unused')"""),
-                        {
-                            "user_id": user.id,
-                            "amount": subsidy_amount,
-                            "valid_from": today,
-                            "valid_to": valid_to
-                        }
-                    )
-                    coupon_id = result.lastrowid
-
-                    self.session.execute(
-                        text("UPDATE users SET points = points - :points WHERE id = :user_id"),
-                        {"points": deduct_points, "user_id": user.id}
-                    )
-
-                    self.session.execute(
-                        text("""INSERT INTO weekly_subsidy_records (user_id, week_start, subsidy_amount, points_before, points_deducted, coupon_id)
-                                VALUES (:user_id, :week_start, :subsidy_amount, :points_before, :points_deducted, :coupon_id)"""),
-                        {
-                            "user_id": user.id,
-                            "week_start": today,
-                            "subsidy_amount": subsidy_amount,
-                            "points_before": user.points,
-                            "points_deducted": deduct_points,
-                            "coupon_id": coupon_id
-                        }
-                    )
+                    # 创建优惠券并记录周补贴记录，使用 helper（保持在事务内）
+                    coupon_id = self._create_coupon(user.id, subsidy_amount, today, valid_to, coupon_type='user')
+                    points_before = int(user.points)
+                    # 扣减用户积分
+                    self._update_user_balance(user.id, 'points', Decimal(-deduct_points))
+                    # 插入补贴记录
+                    self._create_weekly_subsidy_record(user.id, today, subsidy_amount, points_before, deduct_points, coupon_id)
 
                     total_distributed += subsidy_amount
                     logger.info(f"用户{user.id}: 优惠券¥{subsidy_amount:.2f}, 扣积分{deduct_points}")
@@ -606,18 +584,13 @@ class FinanceService:
                     if subsidy_amount <= 0:
                         continue
 
-                    self.session.execute(
-                        text("""INSERT INTO weekly_subsidy_records (user_id, week_start, subsidy_amount, points_before, points_deducted, coupon_id)
-                                VALUES (:user_id, :week_start, :subsidy_amount, :points_before, :points_deducted, :coupon_id)"""),
-                        {
-                            "user_id": merchant.id,
-                            "week_start": today,
-                            "subsidy_amount": subsidy_amount,
-                            "points_before": merchant.merchant_points,
-                            "points_deducted": deduct_points,
-                            "coupon_id": coupon_id
-                        }
-                    )
+                    # 为商家创建优惠券
+                    coupon_id = self._create_coupon(merchant.id, subsidy_amount, today, valid_to, coupon_type='user')
+                    points_before = int(merchant.merchant_points)
+                    # 扣减商家积分（merchant_points）
+                    self._update_user_balance(merchant.id, 'merchant_points', Decimal(-deduct_points))
+                    # 插入补贴记录
+                    self._create_weekly_subsidy_record(merchant.id, today, subsidy_amount, points_before, deduct_points, coupon_id)
 
                     total_distributed += subsidy_amount
                     logger.info(f"商家{merchant.id}: 优惠券¥{subsidy_amount:.2f}, 扣积分{deduct_points}")
@@ -827,6 +800,36 @@ class FinanceService:
         )
         row = result.fetchone()
         return Decimal(str(getattr(row, field, 0))) if row else Decimal('0')
+
+    def _create_coupon(self, user_id: int, amount: Decimal, valid_from: datetime.date, valid_to: datetime.date, coupon_type: str = 'user') -> int:
+        """创建优惠券并返回 coupon_id。应在事务上下文中调用。"""
+        result = self.session.execute(
+            text("""INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
+                    VALUES (:user_id, :coupon_type, :amount, :valid_from, :valid_to, 'unused')"""),
+            {
+                "user_id": user_id,
+                "coupon_type": coupon_type,
+                "amount": amount,
+                "valid_from": valid_from,
+                "valid_to": valid_to
+            }
+        )
+        return result.lastrowid
+
+    def _create_weekly_subsidy_record(self, user_id: int, week_start: datetime.date, subsidy_amount: Decimal, points_before: int, points_deducted: int, coupon_id: Optional[int]) -> None:
+        """插入 weekly_subsidy_records 记录。"""
+        self.session.execute(
+            text("""INSERT INTO weekly_subsidy_records (user_id, week_start, subsidy_amount, points_before, points_deducted, coupon_id)
+                    VALUES (:user_id, :week_start, :subsidy_amount, :points_before, :points_deducted, :coupon_id)"""),
+            {
+                "user_id": user_id,
+                "week_start": week_start,
+                "subsidy_amount": subsidy_amount,
+                "points_before": points_before,
+                "points_deducted": points_deducted,
+                "coupon_id": coupon_id
+            }
+        )
 
     def _get_balance_after(self, account_type: str, related_user: Optional[int] = None) -> Decimal:
         if related_user and account_type in ['promotion_balance', 'merchant_balance']:
