@@ -1,10 +1,10 @@
 # database_setup.py - 表结构与项目2完全一致
 import logging
-import pymysql
+#import pymysql
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.pool import QueuePool
-from config import DB_CONFIG, PLATFORM_MERCHANT_ID, MEMBER_PRODUCT_PRICE
+from src.config import get_db_config, PLATFORM_MERCHANT_ID, MEMBER_PRODUCT_PRICE
 
 logger = logging.getLogger(__name__)
 
@@ -15,10 +15,11 @@ def get_engine():
     global _engine
     if _engine is None:
         try:
+            cfg = get_db_config()
             connection_url = (
-                f"mysql+pymysql://{DB_CONFIG['user']}:{DB_CONFIG['password']}"
-                f"@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
-                f"?charset={DB_CONFIG['charset']}"
+                f"mysql+pymysql://{cfg['user']}:{cfg['password']}"
+                f"@{cfg['host']}:{cfg['port']}/{cfg['database']}"
+                f"?charset={cfg['charset']}"
             )
             _engine = create_engine(
                 connection_url,
@@ -62,7 +63,7 @@ class DatabaseManager:
 
     def _ensure_database_exists(self):
         try:
-            temp_config = DB_CONFIG.copy()
+            temp_config = get_db_config().copy()
             database = temp_config.pop('database')
             import pymysql
             conn = pymysql.connect(**temp_config)

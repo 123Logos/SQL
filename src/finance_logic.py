@@ -5,11 +5,10 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from config import (
+from src.config import (
     AllocationKey, ALLOCATIONS, MAX_POINTS_VALUE, TAX_RATE,
     POINTS_DISCOUNT_RATE, MEMBER_PRODUCT_PRICE, COUPON_VALID_DAYS,
     PLATFORM_MERCHANT_ID, MAX_PURCHASE_PER_DAY, MAX_TEAM_LAYER,
-    RewardType, RewardStatus, CouponType, CouponStatus, WithdrawalStatus,
     LOG_FILE
 )
 
