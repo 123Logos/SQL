@@ -1,5 +1,6 @@
 # api_interface.py - 接口逻辑与项目2完全对齐
 import logging
+import os
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 from decimal import Decimal
@@ -12,13 +13,13 @@ from sqlalchemy import text
 
 from src.database_setup import get_db_session, DatabaseManager
 from src.finance_logic import FinanceService, FinanceException, OrderException
-from src.config import PLATFORM_MERCHANT_ID, MEMBER_PRODUCT_PRICE, MAX_TEAM_LAYER
+from src.config import PLATFORM_MERCHANT_ID, MEMBER_PRODUCT_PRICE, MAX_TEAM_LAYER, LOG_DIR
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("logs/api.log", encoding='utf-8'),
+        logging.FileHandler(os.path.join(LOG_DIR, "api.log"), encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
