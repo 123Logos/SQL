@@ -1,10 +1,10 @@
 # database_setup.py - 表结构与项目2完全一致
 import logging
-import pymysql
+#import pymysql
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.pool import QueuePool
-from config import DB_CONFIG, PLATFORM_MERCHANT_ID, MEMBER_PRODUCT_PRICE
+from src.config import get_db_config, PLATFORM_MERCHANT_ID, MEMBER_PRODUCT_PRICE
 
 logger = logging.getLogger(__name__)
 
@@ -15,10 +15,11 @@ def get_engine():
     global _engine
     if _engine is None:
         try:
+            cfg = get_db_config()
             connection_url = (
-                f"mysql+pymysql://{DB_CONFIG['user']}:{DB_CONFIG['password']}"
-                f"@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
-                f"?charset={DB_CONFIG['charset']}"
+                f"mysql+pymysql://{cfg['user']}:{cfg['password']}"
+                f"@{cfg['host']}:{cfg['port']}/{cfg['database']}"
+                f"?charset={cfg['charset']}"
             )
             _engine = create_engine(
                 connection_url,
@@ -62,7 +63,7 @@ class DatabaseManager:
 
     def _ensure_database_exists(self):
         try:
-            temp_config = DB_CONFIG.copy()
+            temp_config = get_db_config().copy()
             database = temp_config.pop('database')
             import pymysql
             conn = pymysql.connect(**temp_config)
@@ -314,23 +315,51 @@ class DatabaseManager:
 
         pwd_hash = '$2b$12$9LjsHS5r4u1M9K4nG5KZ7e6zZxZn7qZ'
 
-        result = conn.execute(
-            text("INSERT INTO users (mobile, password_hash, name, status) VALUES (:mobile, :pwd, :name, 1)"),
-            {"mobile": '13800138004', "pwd": pwd_hash, "name": '优质商家'}
-        )
-        merchant_id = result.lastrowid
+        mobile = '13800138004'
+        # 幂等处理：如果手机号已存在则复用该用户，否则插入新用户
+        existing = conn.execute(
+            text("SELECT id FROM users WHERE mobile = :mobile"),
+            {"mobile": mobile}
+        ).fetchone()
+        if existing and getattr(existing, 'id', None):
+            merchant_id = existing.id
+            logger.info(f"ℹ️ 测试商家手机号已存在，复用商家ID: {merchant_id}")
+        else:
+            result = conn.execute(
+                text("INSERT INTO users (mobile, password_hash, name, status) VALUES (:mobile, :pwd, :name, 1)"),
+                {"mobile": mobile, "pwd": pwd_hash, "name": '优质商家'}
+            )
+            merchant_id = result.lastrowid
 
-        conn.execute(
-            text("""INSERT INTO products (sku, name, price, stock, is_member_product, merchant_id, status)
-                    VALUES (:sku, :name, :price, 100, 1, :merchant_id, 1)"""),
-            {"sku": 'SKU-MEMBER-001', "name": '会员星卡', "price": float(MEMBER_PRODUCT_PRICE), "merchant_id": PLATFORM_MERCHANT_ID}
-        )
+        # 创建会员商品（若 SKU 已存在则跳过）
+        sku_member = 'SKU-MEMBER-001'
+        existing_prod = conn.execute(
+            text("SELECT id FROM products WHERE sku = :sku"),
+            {"sku": sku_member}
+        ).fetchone()
+        if existing_prod and getattr(existing_prod, 'id', None):
+            logger.info(f"ℹ️ 会员商品 SKU 已存在，跳过插入，product_id={existing_prod.id}")
+        else:
+            conn.execute(
+                text("""INSERT INTO products (sku, name, price, stock, is_member_product, merchant_id, status)
+                        VALUES (:sku, :name, :price, 100, 1, :merchant_id, 1)"""),
+                {"sku": sku_member, "name": '会员星卡', "price": float(MEMBER_PRODUCT_PRICE), "merchant_id": PLATFORM_MERCHANT_ID}
+            )
 
-        conn.execute(
-            text("""INSERT INTO products (sku, name, price, stock, is_member_product, merchant_id, status)
-                    VALUES (:sku, :name, 500.00, 200, 0, :merchant_id, 1)"""),
-            {"sku": 'SKU-NORMAL-001', "name": '普通商品', "merchant_id": merchant_id}
-        )
+        # 创建普通商品（若 SKU 已存在则跳过）
+        sku_normal = 'SKU-NORMAL-001'
+        existing_normal = conn.execute(
+            text("SELECT id FROM products WHERE sku = :sku"),
+            {"sku": sku_normal}
+        ).fetchone()
+        if existing_normal and getattr(existing_normal, 'id', None):
+            logger.info(f"ℹ️ 普通商品 SKU 已存在，跳过插入，product_id={existing_normal.id}")
+        else:
+            conn.execute(
+                text("""INSERT INTO products (sku, name, price, stock, is_member_product, merchant_id, status)
+                        VALUES (:sku, :name, 500.00, 200, 0, :merchant_id, 1)"""),
+                {"sku": sku_normal, "name": '普通商品', "merchant_id": merchant_id}
+            )
 
         conn.commit()
         logger.info(f"✅ 测试数据创建完成 | 商家ID: {merchant_id}")

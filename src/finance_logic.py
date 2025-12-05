@@ -5,11 +5,10 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from config import (
+from src.config import (
     AllocationKey, ALLOCATIONS, MAX_POINTS_VALUE, TAX_RATE,
     POINTS_DISCOUNT_RATE, MEMBER_PRODUCT_PRICE, COUPON_VALID_DAYS,
     PLATFORM_MERCHANT_ID, MAX_PURCHASE_PER_DAY, MAX_TEAM_LAYER,
-    RewardType, RewardStatus, CouponType, CouponStatus, WithdrawalStatus,
     LOG_FILE
 )
 
@@ -79,60 +78,63 @@ class FinanceService:
 
     def settle_order(self, order_no: str, user_id: int, product_id: int, quantity: int = 1, points_to_use: int = 0) -> int:
         logger.info(f"\n🛒 订单结算开始: {order_no}")
+        try:
+            with self.session.begin():
+                result = self.session.execute(
+                    text("SELECT price, is_member_product, merchant_id FROM products WHERE id = :product_id AND status = 1 FOR UPDATE"),
+                    {"product_id": product_id}
+                )
+                product = result.fetchone()
+                if not product:
+                    raise OrderException(f"商品不存在或已下架: {product_id}")
 
-        result = self.session.execute(
-            text("SELECT price, is_member_product, merchant_id FROM products WHERE id = :product_id AND status = 1 FOR UPDATE"),
-            {"product_id": product_id}
-        )
-        product = result.fetchone()
-        if not product:
-            raise OrderException(f"商品不存在或已下架: {product_id}")
+                merchant_id = product.merchant_id
+                if merchant_id != PLATFORM_MERCHANT_ID:
+                    result = self.session.execute(
+                        text("SELECT id FROM users WHERE id = :merchant_id"),
+                        {"merchant_id": merchant_id}
+                    )
+                    if not result.fetchone():
+                        raise OrderException(f"商家不存在: {merchant_id}")
 
-        merchant_id = product.merchant_id
-        if merchant_id != PLATFORM_MERCHANT_ID:
-            result = self.session.execute(
-                text("SELECT id FROM users WHERE id = :merchant_id"),
-                {"merchant_id": merchant_id}
-            )
-            if not result.fetchone():
-                raise OrderException(f"商家不存在: {merchant_id}")
+                if product.is_member_product and not self.check_purchase_limit(user_id):
+                    raise OrderException("24小时内购买会员商品超过限制（最多2份）")
 
-        if product.is_member_product and not self.check_purchase_limit(user_id):
-            raise OrderException("24小时内购买会员商品超过限制（最多2份）")
+                unit_price = Decimal(str(product.price))
+                original_amount = unit_price * quantity
 
-        unit_price = Decimal(str(product.price))
-        original_amount = unit_price * quantity
+                result = self.session.execute(
+                    text("SELECT member_level, points FROM users WHERE id = :user_id FOR UPDATE"),
+                    {"user_id": user_id}
+                )
+                user = result.fetchone()
+                if not user:
+                    raise OrderException(f"用户不存在: {user_id}")
 
-        result = self.session.execute(
-            text("SELECT member_level, points FROM users WHERE id = :user_id FOR UPDATE"),
-            {"user_id": user_id}
-        )
-        user = result.fetchone()
-        if not user:
-            raise OrderException(f"用户不存在: {user_id}")
+                points_discount = Decimal('0')
+                final_amount = original_amount
 
-        points_discount = Decimal('0')
-        final_amount = original_amount
+                if not product.is_member_product and points_to_use > 0:
+                    self._apply_points_discount(user_id, user, points_to_use, original_amount)
+                    points_discount = Decimal(points_to_use) * POINTS_DISCOUNT_RATE
+                    final_amount = original_amount - points_discount
+                    logger.info(f"💳 积分抵扣: {points_to_use}分 = ¥{points_discount}")
 
-        if not product.is_member_product and points_to_use > 0:
-            self._apply_points_discount(user_id, user, points_to_use, original_amount)
-            points_discount = Decimal(points_to_use) * POINTS_DISCOUNT_RATE
-            final_amount = original_amount - points_discount
-            logger.info(f"💳 积分抵扣: {points_to_use}分 = ¥{points_discount}")
+                order_id = self._create_order(
+                    order_no, user_id, merchant_id, product_id,
+                    final_amount, original_amount, points_discount, product.is_member_product
+                )
 
-        order_id = self._create_order(
-            order_no, user_id, merchant_id, product_id,
-            final_amount, original_amount, points_discount, product.is_member_product
-        )
+                if product.is_member_product:
+                    self._process_member_order(order_id, user_id, user, unit_price, quantity)
+                else:
+                    self._process_normal_order(order_id, user_id, merchant_id, final_amount, user.member_level)
 
-        if product.is_member_product:
-            self._process_member_order(order_id, user_id, user, unit_price, quantity)
-        else:
-            self._process_normal_order(order_id, user_id, merchant_id, final_amount, user.member_level)
-
-        self.session.commit()
-        logger.info(f"✅ 订单结算成功: ID={order_id}")
-        return order_id
+            logger.info(f"✅ 订单结算成功: ID={order_id}")
+            return order_id
+        except Exception as e:
+            logger.error(f"订单结算失败: {e}")
+            raise
 
     def _apply_points_discount(self, user_id: int, user, points_to_use: int, amount: Decimal) -> None:
         if user.points < points_to_use:
@@ -200,50 +202,32 @@ class FinanceService:
             {"user_id": user_id}
         )
         new_points = result.fetchone().points
-
-        self.session.execute(
-            text("""INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order)
-                    VALUES (:user_id, :change, :balance, 'member', '购买会员商品获得积分', :order_id)"""),
-            {
-                "user_id": user_id,
-                "change": points_earned,
-                "balance": new_points,
-                "order_id": order_id
-            }
-        )
+        # 使用 helper 插入 points_log
+        self._insert_points_log(user_id=user_id,
+                                change_amount=points_earned,
+                                balance_after=new_points,
+                                type='member',
+                                reason='购买会员商品获得积分',
+                                related_order=order_id)
         logger.info(f"🎉 用户升级: {old_level}星 → {new_level}星, 获得积分: {points_earned}")
 
         self._create_pending_rewards(order_id, user_id, old_level, new_level)
 
         company_points = int(total_amount * Decimal('0.20'))
-        self.session.execute(
-            text("UPDATE finance_accounts SET balance = balance + :points WHERE account_type = 'company_points'"),
-            {"points": company_points}
-        )
+        self._add_pool_balance('company_points', Decimal(company_points), f"订单#{order_id} 公司积分分配")
 
     def _allocate_funds_to_pools(self, order_id: int, total_amount: Decimal) -> None:
         platform_revenue = total_amount * Decimal('0.80')
-        self.session.execute(
-            text("UPDATE finance_accounts SET balance = balance + :amount WHERE account_type = 'platform_revenue_pool'"),
-            {"amount": platform_revenue}
-        )
+        # 使用 helper 统一处理平台池子余额变更与流水
+        self._add_pool_balance('platform_revenue_pool', platform_revenue, f"订单#{order_id} 平台收入")
 
         for purpose, percent in ALLOCATIONS.items():
             if purpose == AllocationKey.PLATFORM_REVENUE_POOL:
                 continue
             alloc_amount = total_amount * percent
-            self.session.execute(
-                text("UPDATE finance_accounts SET balance = balance + :amount WHERE account_type = :type"),
-                {"amount": alloc_amount, "type": purpose.value}
-            )
+            # 统一通过 helper 更新各类池子与记录流水
+            self._add_pool_balance(purpose.value, alloc_amount, f"订单#{order_id} 分配到{purpose.value}")
             if purpose == AllocationKey.PUBLIC_WELFARE:
-                self._record_flow(
-                    account_type=purpose.value,
-                    related_user=None,
-                    change_amount=alloc_amount,
-                    flow_type='income',
-                    remark=f"订单#{order_id}贡献公益基金"
-                )
                 logger.info(f"🎗️ 公益基金获得: ¥{alloc_amount}")
 
     def _create_pending_rewards(self, order_id: int, buyer_id: int, old_level: int, new_level: int) -> None:
@@ -310,87 +294,51 @@ class FinanceService:
                               final_amount: Decimal, member_level: int) -> None:
         if merchant_id != PLATFORM_MERCHANT_ID:
             merchant_amount = final_amount * Decimal('0.80')
-            self.session.execute(
-                text("UPDATE users SET merchant_balance = merchant_balance + :amount WHERE id = :user_id"),
-                {"amount": merchant_amount, "user_id": merchant_id}
-            )
-            self._record_flow(
-                account_type='merchant_balance',
-                related_user=merchant_id,
-                change_amount=merchant_amount,
-                flow_type='income',
-                remark=f"普通商品收益 - 订单#{order_id}"
-            )
+            # 更新商家余额并记录流水
+            # new_merchant_balance = self._update_user_balance(merchant_id, 'merchant_balance', merchant_amount)
+            # self._insert_account_flow(account_type='merchant_balance',
+            #                           related_user=merchant_id,
+            #                           change_amount=merchant_amount,
+            #                           flow_type='income',
+            #                           remark=f"普通商品收益 - 订单#{order_id}")
             logger.info(f"💰 商家{merchant_id}到账: ¥{merchant_amount}")
         else:
             platform_amount = final_amount * Decimal('0.80')
-            self.session.execute(
-                text("UPDATE finance_accounts SET balance = balance + :amount WHERE account_type = 'platform_revenue_pool'"),
-                {"amount": platform_amount}
-            )
+            # 平台自营商品收入进入平台池子
+            self._add_pool_balance('platform_revenue_pool', platform_amount, f"平台自营商品收入 - 订单#{order_id}")
             logger.info(f"💰 平台自营商品收入: ¥{platform_amount}")
 
-        for purpose, percent in ALLOCATIONS.items():
-            alloc_amount = final_amount * percent
-            self.session.execute(
-                text("UPDATE finance_accounts SET balance = balance + :amount WHERE account_type = :type"),
-                {"amount": alloc_amount, "type": purpose.value}
-            )
-            if purpose == AllocationKey.PUBLIC_WELFARE:
-                self._record_flow(
-                    account_type=purpose.value,
-                    related_user=user_id,
-                    change_amount=alloc_amount,
-                    flow_type='income',
-                    remark=f"订单#{order_id}贡献公益基金"
-                )
-                logger.info(f"🎗️ 公益基金获得: ¥{alloc_amount}")
+            for purpose, percent in ALLOCATIONS.items():
+                alloc_amount = final_amount * percent
+                # 统一通过 helper 更新池子并记录流水
+                self._add_pool_balance(purpose.value, alloc_amount, f"订单#{order_id} 分配到{purpose.value}", related_user=user_id)
+                if purpose == AllocationKey.PUBLIC_WELFARE:
+                    logger.info(f"🎗️ 公益基金获得: ¥{alloc_amount}")
 
         if member_level >= 1:
             points_earned = int(final_amount)
-            self.session.execute(
-                text("UPDATE users SET points = points + :points WHERE id = :user_id"),
-                {"points": points_earned, "user_id": user_id}
-            )
-            result = self.session.execute(
-                text("SELECT points FROM users WHERE id = :user_id"),
-                {"user_id": user_id}
-            )
-            new_points = result.fetchone().points
-            self.session.execute(
-                text("""INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order)
-                        VALUES (:user_id, :change, :balance, 'member', '购买获得积分', :order_id)"""),
-                {
-                    "user_id": user_id,
-                    "change": points_earned,
-                    "balance": new_points,
-                    "order_id": order_id
-                }
-            )
+            # 使用 helper 更新用户积分并返回新积分
+            new_points_dec = self._update_user_balance(user_id, 'points', Decimal(points_earned))
+            new_points = int(new_points_dec)
+            self._insert_points_log(user_id=user_id,
+                                    change_amount=points_earned,
+                                    balance_after=new_points,
+                                    type='member',
+                                    reason='购买获得积分',
+                                    related_order=order_id)
             logger.info(f"💎 用户获得积分: {points_earned}")
 
         if merchant_id != PLATFORM_MERCHANT_ID:
             merchant_points = int(final_amount * Decimal('0.20'))
             if merchant_points > 0:
-                self.session.execute(
-                    text("UPDATE users SET merchant_points = merchant_points + :points WHERE id = :user_id"),
-                    {"points": merchant_points, "user_id": merchant_id}
-                )
-                result = self.session.execute(
-                    text("SELECT merchant_points FROM users WHERE id = :user_id"),
-                    {"user_id": merchant_id}
-                )
-                new_merchant_points = result.fetchone().merchant_points
-                self.session.execute(
-                    text("""INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order)
-                            VALUES (:user_id, :change, :balance, 'merchant', '销售获得积分', :order_id)"""),
-                    {
-                        "user_id": merchant_id,
-                        "change": merchant_points,
-                        "balance": new_merchant_points,
-                        "order_id": order_id
-                    }
-                )
+                new_mp_dec = self._update_user_balance(merchant_id, 'merchant_points', Decimal(merchant_points))
+                new_merchant_points = int(new_mp_dec)
+                self._insert_points_log(user_id=merchant_id,
+                                        change_amount=merchant_points,
+                                        balance_after=new_merchant_points,
+                                        type='merchant',
+                                        reason='销售获得积分',
+                                        related_order=order_id)
                 logger.info(f"💎 商家获得积分: {merchant_points}")
 
     def audit_and_distribute_rewards(self, reward_ids: List[int], approve: bool, auditor: str = 'admin') -> bool:
@@ -486,91 +434,85 @@ class FinanceService:
 
     def refund_order(self, order_no: str) -> bool:
         try:
-            result = self.session.execute(
-                text("SELECT * FROM orders WHERE order_no = :order_no FOR UPDATE"),
-                {"order_no": order_no}
-            )
-            order = result.fetchone()
-
-            if not order or order.status == 'refunded':
-                raise FinanceException("订单不存在或已退款")
-
-            is_member = order.is_member_order
-            user_id = order.user_id
-            amount = Decimal(str(order.total_amount))
-            merchant_id = order.merchant_id
-
-            logger.info(f"\n💸 订单退款: {order_no} (会员商品: {is_member})")
-
-            if is_member:
+            with self.session.begin():
                 result = self.session.execute(
-                    text("SELECT referrer_id FROM user_referrals WHERE user_id = :user_id"),
-                    {"user_id": user_id}
+                    text("SELECT * FROM orders WHERE order_no = :order_no FOR UPDATE"),
+                    {"order_no": order_no}
                 )
-                referrer = result.fetchone()
-                if referrer and referrer.referrer_id:
-                    reward_amount = Decimal(str(order.original_amount)) * Decimal('0.50')
-                    self.session.execute(
-                        text("""UPDATE users SET promotion_balance = promotion_balance - :amount
-                                WHERE id = :user_id AND promotion_balance >= :amount"""),
-                        {"amount": reward_amount, "user_id": referrer.referrer_id}
-                    )
+                order = result.fetchone()
 
-                result = self.session.execute(
-                    text("SELECT user_id, reward_amount FROM team_rewards WHERE order_id = :order_id"),
+                if not order or order.status == 'refunded':
+                    raise FinanceException("订单不存在或已退款")
+
+                is_member = order.is_member_order
+                user_id = order.user_id
+                amount = Decimal(str(order.total_amount))
+                merchant_id = order.merchant_id
+
+                logger.info(f"\n💸 订单退款: {order_no} (会员商品: {is_member})")
+
+                if is_member:
+                    result = self.session.execute(
+                        text("SELECT referrer_id FROM user_referrals WHERE user_id = :user_id"),
+                        {"user_id": user_id}
+                    )
+                    referrer = result.fetchone()
+                    if referrer and referrer.referrer_id:
+                        reward_amount = Decimal(str(order.original_amount)) * Decimal('0.50')
+                        self.session.execute(
+                            text("""UPDATE users SET promotion_balance = promotion_balance - :amount
+                                    WHERE id = :user_id AND promotion_balance >= :amount"""),
+                            {"amount": reward_amount, "user_id": referrer.referrer_id}
+                        )
+
+                    result = self.session.execute(
+                        text("SELECT user_id, reward_amount FROM team_rewards WHERE order_id = :order_id"),
+                        {"order_id": order.id}
+                    )
+                    rewards = result.fetchall()
+                    for reward in rewards:
+                        self.session.execute(
+                            text("""UPDATE users SET promotion_balance = promotion_balance - :amount
+                                    WHERE id = :user_id AND promotion_balance >= :amount"""),
+                            {"amount": reward.reward_amount, "user_id": reward.user_id}
+                        )
+
+                    user_points = int(order.original_amount)
+                    self.session.execute(
+                        text("UPDATE users SET points = GREATEST(points - :points, 0) WHERE id = :user_id"),
+                        {"points": user_points, "user_id": user_id}
+                    )
+                    self.session.execute(
+                        text("UPDATE users SET member_level = GREATEST(member_level - 1, 0) WHERE id = :user_id"),
+                        {"user_id": user_id}
+                    )
+                    logger.info(f"⚠️ 用户{user_id}退款后降级")
+
+                merchant_amount = amount * Decimal('0.80')
+
+                if is_member:
+                    self._check_pool_balance('platform_revenue_pool', merchant_amount)
+                    # 从平台收入池扣减并记录流水
+                    self._add_pool_balance('platform_revenue_pool', -merchant_amount, f"退款 - 订单#{order_no}")
+                else:
+                    if merchant_id == PLATFORM_MERCHANT_ID:
+                        self._add_pool_balance('platform_revenue_pool', -merchant_amount, f"退款 - 订单#{order_no}")
+                    else:
+                        self._check_user_balance(merchant_id, merchant_amount, 'merchant_balance')
+                        self.session.execute(
+                            text("UPDATE users SET merchant_balance = merchant_balance - :amount WHERE id = :merchant_id"),
+                            {"amount": merchant_amount, "merchant_id": merchant_id}
+                        )
+
+                self.session.execute(
+                    text("UPDATE orders SET refund_status = 'refunded', updated_at = NOW() WHERE id = :order_id"),
                     {"order_id": order.id}
                 )
-                rewards = result.fetchall()
-                for reward in rewards:
-                    self.session.execute(
-                        text("""UPDATE users SET promotion_balance = promotion_balance - :amount
-                                WHERE id = :user_id AND promotion_balance >= :amount"""),
-                        {"amount": reward.reward_amount, "user_id": reward.user_id}
-                    )
 
-                user_points = int(order.original_amount)
-                self.session.execute(
-                    text("UPDATE users SET points = GREATEST(points - :points, 0) WHERE id = :user_id"),
-                    {"points": user_points, "user_id": user_id}
-                )
-                self.session.execute(
-                    text("UPDATE users SET member_level = GREATEST(member_level - 1, 0) WHERE id = :user_id"),
-                    {"user_id": user_id}
-                )
-                logger.info(f"⚠️ 用户{user_id}退款后降级")
-
-            merchant_amount = amount * Decimal('0.80')
-
-            if is_member:
-                self._check_pool_balance('platform_revenue_pool', merchant_amount)
-                self.session.execute(
-                    text("UPDATE finance_accounts SET balance = balance - :amount WHERE account_type = 'platform_revenue_pool'"),
-                    {"amount": merchant_amount}
-                )
-            else:
-                if merchant_id == PLATFORM_MERCHANT_ID:
-                    self.session.execute(
-                        text("UPDATE finance_accounts SET balance = balance - :amount WHERE account_type = 'platform_revenue_pool'"),
-                        {"amount": merchant_amount}
-                    )
-                else:
-                    self._check_user_balance(merchant_id, merchant_amount, 'merchant_balance')
-                    self.session.execute(
-                        text("UPDATE users SET merchant_balance = merchant_balance - :amount WHERE id = :merchant_id"),
-                        {"amount": merchant_amount, "merchant_id": merchant_id}
-                    )
-
-            self.session.execute(
-                text("UPDATE orders SET refund_status = 'refunded', updated_at = NOW() WHERE id = :order_id"),
-                {"order_id": order.id}
-            )
-
-            self.session.commit()
             logger.info(f"✅ 订单退款成功: {order_no}")
             return True
 
         except Exception as e:
-            self.session.rollback()
             logger.error(f"❌ 退款失败: {e}")
             return False
 
@@ -610,96 +552,83 @@ class FinanceService:
         result = self.session.execute(text("SELECT id, points FROM users WHERE points > 0"))
         users = result.fetchall()
 
-        for user in users:
-            user_points = Decimal(str(user.points))
-            subsidy_amount = user_points * points_value
-            deduct_points = int(subsidy_amount)
+        try:
+            with self.session.begin():
+                for user in users:
+                    user_points = Decimal(str(user.points))
+                    subsidy_amount = user_points * points_value
+                    deduct_points = int(subsidy_amount)
 
-            if subsidy_amount <= 0:
-                continue
+                    if subsidy_amount <= 0:
+                        continue
 
-            result = self.session.execute(
-                text("""INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
-                        VALUES (:user_id, 'user', :amount, :valid_from, :valid_to, 'unused')"""),
-                {
-                    "user_id": user.id,
-                    "amount": subsidy_amount,
-                    "valid_from": today,
-                    "valid_to": valid_to
-                }
-            )
-            coupon_id = result.lastrowid
+                    result = self.session.execute(
+                        text("""INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
+                                VALUES (:user_id, 'user', :amount, :valid_from, :valid_to, 'unused')"""),
+                        {
+                            "user_id": user.id,
+                            "amount": subsidy_amount,
+                            "valid_from": today,
+                            "valid_to": valid_to
+                        }
+                    )
+                    coupon_id = result.lastrowid
 
-            self.session.execute(
-                text("UPDATE users SET points = points - :points WHERE id = :user_id"),
-                {"points": deduct_points, "user_id": user.id}
-            )
+                    self.session.execute(
+                        text("UPDATE users SET points = points - :points WHERE id = :user_id"),
+                        {"points": deduct_points, "user_id": user.id}
+                    )
 
-            self.session.execute(
-                text("""INSERT INTO weekly_subsidy_records (user_id, week_start, subsidy_amount, points_before, points_deducted, coupon_id)
-                        VALUES (:user_id, :week_start, :subsidy_amount, :points_before, :points_deducted, :coupon_id)"""),
-                {
-                    "user_id": user.id,
-                    "week_start": today,
-                    "subsidy_amount": subsidy_amount,
-                    "points_before": user.points,
-                    "points_deducted": deduct_points,
-                    "coupon_id": coupon_id
-                }
-            )
+                    self.session.execute(
+                        text("""INSERT INTO weekly_subsidy_records (user_id, week_start, subsidy_amount, points_before, points_deducted, coupon_id)
+                                VALUES (:user_id, :week_start, :subsidy_amount, :points_before, :points_deducted, :coupon_id)"""),
+                        {
+                            "user_id": user.id,
+                            "week_start": today,
+                            "subsidy_amount": subsidy_amount,
+                            "points_before": user.points,
+                            "points_deducted": deduct_points,
+                            "coupon_id": coupon_id
+                        }
+                    )
 
-            total_distributed += subsidy_amount
-            logger.info(f"用户{user.id}: 优惠券¥{subsidy_amount:.2f}, 扣积分{deduct_points}")
+                    total_distributed += subsidy_amount
+                    logger.info(f"用户{user.id}: 优惠券¥{subsidy_amount:.2f}, 扣积分{deduct_points}")
 
-        result = self.session.execute(text("SELECT id, merchant_points FROM users WHERE merchant_points > 0"))
-        merchants = result.fetchall()
+                result = self.session.execute(text("SELECT id, merchant_points FROM users WHERE merchant_points > 0"))
+                merchants = result.fetchall()
 
-        for merchant in merchants:
-            merchant_points = Decimal(str(merchant.merchant_points))
-            subsidy_amount = merchant_points * points_value
-            deduct_points = int(subsidy_amount)
+                for merchant in merchants:
+                    merchant_points = Decimal(str(merchant.merchant_points))
+                    subsidy_amount = merchant_points * points_value
+                    deduct_points = int(subsidy_amount)
 
-            if subsidy_amount <= 0:
-                continue
+                    if subsidy_amount <= 0:
+                        continue
 
-            '''result = self.session.execute(
-                text("""INSERT INTO coupons (user_id, coupon_type, amount, valid_from, valid_to, status)
-                        VALUES (:user_id, 'merchant', :amount, :valid_from, :valid_to, 'unused')"""),
-                {
-                    "user_id": merchant.id,
-                    "amount": subsidy_amount,
-                    "valid_from": today,
-                    "valid_to": valid_to
-                }
-            )
-            coupon_id = result.lastrowid
+                    self.session.execute(
+                        text("""INSERT INTO weekly_subsidy_records (user_id, week_start, subsidy_amount, points_before, points_deducted, coupon_id)
+                                VALUES (:user_id, :week_start, :subsidy_amount, :points_before, :points_deducted, :coupon_id)"""),
+                        {
+                            "user_id": merchant.id,
+                            "week_start": today,
+                            "subsidy_amount": subsidy_amount,
+                            "points_before": merchant.merchant_points,
+                            "points_deducted": deduct_points,
+                            "coupon_id": coupon_id
+                        }
+                    )
 
-            self.session.execute(
-                text("UPDATE users SET merchant_points = merchant_points - :points WHERE id = :user_id"),
-                {"points": deduct_points, "user_id": merchant.id}
-            )'''
+                    total_distributed += subsidy_amount
+                    logger.info(f"商家{merchant.id}: 优惠券¥{subsidy_amount:.2f}, 扣积分{deduct_points}")
 
-            self.session.execute(
-                text("""INSERT INTO weekly_subsidy_records (user_id, week_start, subsidy_amount, points_before, points_deducted, coupon_id)
-                        VALUES (:user_id, :week_start, :subsidy_amount, :points_before, :points_deducted, :coupon_id)"""),
-                {
-                    "user_id": merchant.id,
-                    "week_start": today,
-                    "subsidy_amount": subsidy_amount,
-                    "points_before": merchant.merchant_points,
-                    "points_deducted": deduct_points,
-                    "coupon_id": coupon_id
-                }
-            )
+                logger.info(f"ℹ️ 公司积分{company_points}未扣除，未发放优惠券")
 
-            total_distributed += subsidy_amount
-            logger.info(f"商家{merchant.id}: 优惠券¥{subsidy_amount:.2f}, 扣积分{deduct_points}")
-
-        logger.info(f"ℹ️ 公司积分{company_points}未扣除，未发放优惠券")
-
-        self.session.commit()
-        logger.info(f"✅ 周补贴完成: 发放¥{total_distributed:.2f}优惠券（补贴池余额不变: ¥{pool_balance}，公司积分不扣除）")
-        return True
+            logger.info(f"✅ 周补贴完成: 发放¥{total_distributed:.2f}优惠券（补贴池余额不变: ¥{pool_balance}，公司积分不扣除）")
+            return True
+        except Exception as e:
+            logger.error(f"❌ 周补贴发放失败: {e}")
+            return False
 
     def apply_withdrawal(self, user_id: int, amount: float, withdrawal_type: str = 'user') -> Optional[int]:
         try:
@@ -819,6 +748,19 @@ class FinanceService:
     def _record_flow(self, account_type: str, related_user: Optional[int],
                      change_amount: Decimal, flow_type: str,
                      remark: str, account_id: Optional[int] = None) -> None:
+        # 兼容封装：使用内部统一的 account_flow 插入函数
+        self._insert_account_flow(account_type=account_type,
+                                   related_user=related_user,
+                                   change_amount=change_amount,
+                                   flow_type=flow_type,
+                                   remark=remark,
+                                   account_id=account_id)
+
+    def _insert_account_flow(self, account_type: str, related_user: Optional[int],
+                             change_amount: Decimal, flow_type: str,
+                             remark: str, account_id: Optional[int] = None) -> None:
+        """在 `account_flow` 中插入流水，并通过 `_get_balance_after` 计算插入时的余额。
+        该函数应在事务上下文中调用（不负责提交/回滚）。"""
         balance_after = self._get_balance_after(account_type, related_user)
         self.session.execute(
             text("""INSERT INTO account_flow (account_id, account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
@@ -833,6 +775,58 @@ class FinanceService:
                 "remark": remark
             }
         )
+
+    def _add_pool_balance(self, account_type: str, amount: Decimal, remark: str, related_user: Optional[int] = None) -> Decimal:
+        """对平台/池子类账户 (`finance_accounts`) 增减余额并记录流水。
+        返回更新后的余额（Decimal）。"""
+        self.session.execute(
+            text("UPDATE finance_accounts SET balance = balance + :amount WHERE account_type = :type"),
+            {"amount": amount, "type": account_type}
+        )
+        result = self.session.execute(
+            text("SELECT balance FROM finance_accounts WHERE account_type = :type"),
+            {"type": account_type}
+        )
+        row = result.fetchone()
+        balance_after = Decimal(str(row.balance)) if row else Decimal('0')
+        # 记录流水（income/expense 由 amount 正负决定）
+        flow_type = 'income' if amount >= 0 else 'expense'
+        self._insert_account_flow(account_type=account_type,
+                                   related_user=related_user,
+                                   change_amount=amount,
+                                   flow_type=flow_type,
+                                   remark=remark)
+        return balance_after
+
+    def _insert_points_log(self, user_id: int, change_amount: int, balance_after: int, type: str, reason: str, related_order: Optional[int] = None) -> None:
+        """插入 `points_log` 记录。change_amount 使用整数（分/积分）。"""
+        self.session.execute(
+            text("""INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
+                    VALUES (:user_id, :change, :balance, :type, :reason, :related_order, NOW())"""),
+            {
+                "user_id": user_id,
+                "change": change_amount,
+                "balance": balance_after,
+                "type": type,
+                "reason": reason,
+                "related_order": related_order
+            }
+        )
+
+    def _update_user_balance(self, user_id: int, field: str, delta: Decimal) -> Decimal:
+        """对 `users` 表的指定余额字段做增减，并返回更新后的值。
+        注意：`field` 必须是受信任的字段名（由调用处保证）。"""
+        # 使用字符串插值构造字段位置（确保调用方只传入受控字段名）
+        self.session.execute(
+            text(f"UPDATE users SET {field} = {field} + :delta WHERE id = :user_id"),
+            {"delta": delta, "user_id": user_id}
+        )
+        result = self.session.execute(
+            text(f"SELECT {field} FROM users WHERE id = :user_id"),
+            {"user_id": user_id}
+        )
+        row = result.fetchone()
+        return Decimal(str(getattr(row, field, 0))) if row else Decimal('0')
 
     def _get_balance_after(self, account_type: str, related_user: Optional[int] = None) -> Decimal:
         if related_user and account_type in ['promotion_balance', 'merchant_balance']:

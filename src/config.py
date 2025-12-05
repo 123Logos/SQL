@@ -5,17 +5,21 @@ from typing import Final
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
 
-# 数据库配置
-DB_CONFIG = {
-    'host': os.getenv('MYSQL_HOST', '127.0.0.1'),
-    'port': int(os.getenv('MYSQL_PORT', 3306)),
-    'user': os.getenv('MYSQL_USER'),
-    'password': os.getenv('MYSQL_PASSWORD'),
-    'database': os.getenv('MYSQL_DATABASE'),
-    'charset': 'utf8mb4',
-}
+def get_db_config():
+    load_dotenv()
+    cfg = {
+        'host': os.getenv('MYSQL_HOST', '127.0.0.1'),
+        'port': int(os.getenv('MYSQL_PORT', 3306)),
+        'user': os.getenv('MYSQL_USER'),
+        'password': os.getenv('MYSQL_PASSWORD'),
+        'database': os.getenv('MYSQL_DATABASE'),
+        'charset': 'utf8mb4',
+    }
+    missing = [k for k in ('user', 'password', 'database') if not cfg.get(k)]
+    if missing:
+        raise RuntimeError(f"缺少必要的数据库环境变量: {', '.join(missing)}\n")
+    return cfg
 
 # 平台常量
 PLATFORM_MERCHANT_ID: Final[int] = 0
